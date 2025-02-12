@@ -1,7 +1,6 @@
 # @title Begin Automation
 
-from google.colab import files
-from google.colab import drive
+from google.colab import files, drive
 import pandas as pd
 import sys
 import time
@@ -19,7 +18,7 @@ bom_file = None
 try:
   drive.mount('/content/drive')
 except Exception as ex:
-  print('There was an issue connecting to the Google Drive. Please try again')
+  print('[ERROR] There was an issue connecting to the Google Drive. Please try again')
   sys.exit(1)
 
 # ====
@@ -27,12 +26,12 @@ except Exception as ex:
 # ====
 
 if len(uploaded) != 2:
-  print('Please upload exactly 2 files')
+  print('[ERROR] Please upload exactly 2 files')
   sys.exit(1)
 
 for filename in uploaded.keys():
   if 'por' in filename.lower() and 'bom' in filename.lower():
-    print(f'Error: {filename} cannot contain both BOM and POR in the filename')
+    print(f'[ERROR] {filename} cannot contain both BOM and POR in the filename')
     shutil.copyfile(
         filename,
         f'/content/drive/MyDrive/DemandPlanning/error/{filename}')
@@ -46,13 +45,13 @@ for filename in uploaded.keys():
 if por_file:
   print(f'Plan of Records file: {por_file}')
 else:
-  print('Plan of Records file is missing')
+  print('[ERROR] Plan of Records file is missing')
   sys.exit(1)
 
 if bom_file:
   print(f'Bill of Materials file: {bom_file}')
 else:
-  print('Bill of Materials file is missing')
+  print('[ERROR] Bill of Materials file is missing')
   sys.exit(1)
 
 # ====
@@ -68,7 +67,7 @@ else:
   shutil.copyfile(
       por_file,
       f'/content/drive/MyDrive/DemandPlanning/error/{por_file}')
-  print(f'{por_file} is an unsupported file -- please ensure that uploaded file is either an Excel or CSV file')
+  print(f'[ERROR] {por_file} is an unsupported file -- please ensure that uploaded file is either an Excel or CSV file')
   sys.exit(1)
 
 if bom_file.endswith('.csv'):
@@ -79,7 +78,7 @@ else:
   shutil.copyfile(
       bom_file,
       f'/content/drive/MyDrive/DemandPlanning/error/{bom_file}')
-  print(f'{bom_file} is an unsupported file -- please ensure that uploaded file is either an Excel or CSV file')
+  print(f'[ERROR] {bom_file} is an unsupported file -- please ensure that uploaded file is either an Excel or CSV file')
   sys.exit(1)
 
 # ====
@@ -90,7 +89,7 @@ for column in ['region', 'country', 'site_type', 'mf_part_number', 'part_type',
                'grouping', 'part_id', 'uin', 'vendor', 'manufacturer',
                'mf_item_description', 'cost', 'supply_source', 'quantity']:
   if column not in bom.columns:
-    print(f'Please ensure that {column} is present as a column header in the file.')
+    print(f'[ERROR] Please ensure that {column} is present as a column header in the file.')
     shutil.copyfile(
       bom_file,
       f'/content/drive/MyDrive/DemandPlanning/error/{bom_file}')
@@ -104,7 +103,7 @@ for column in ['region', 'country', 'investment_id', 'investment_name', 'site_id
                'mdf_type', 'mdf_quantity', 'ap_quantity', 'idf_quantity',
                'infra_value_added_reseller', 'car_status', 'por_confidence_level']:
   if column not in por.columns:
-    print(f'Please ensure that {column} is present as a column header in the file.')
+    print(f'[ERROR] Please ensure that {column} is present as a column header in the file.')
     shutil.copyfile(
       por_file,
       f'/content/drive/MyDrive/DemandPlanning/error/{por_file}')
@@ -139,6 +138,7 @@ por.to_excel(por_filename, index=False)
 shutil.copyfile(
     por_filename,
     f'/content/drive/MyDrive/DemandPlanning/processed/{por_filename}')
+print(f'Uploaded {por_filename} to /processed folder.')
 # files.download(por_filename) -- replace with download function if copy file to drive not working
 
 # ====
@@ -147,54 +147,50 @@ shutil.copyfile(
 #    to download
 # ====
 
-# Standardize part_type column in bom
-bom['part_type'] = bom['part_type'].str.lower().fillna('')
+bom = bom[bom['site_type'].notna() & (bom['site_type'] != '')]
+# Merge POR and BOM on 'site_type'
+df = por.merge(bom, on='site_type', how='left', suffixes=('', '_bom'))
 
-# Determine rad_site based on part_type
-def get_rad_site(row):
-    if row['part_type'] in ('infrastructure', ''):
-        return row['rad_site_infra']
-    elif row['part_type'] == 'end user equipment':
-        return row['rad_site_eue']
-    return None
+# Process 'rad_site' column
+df['rad_site'] = df['rad_site_infra']
+df.loc[df['part_type'].str.lower() == 'end user equipment', 'rad_site'] = df['rad_site_eue']
 
-# Merge bom and por using left join on site_type
-merged = por.merge(bom, on='site_type', how='left')
+# Process 'site_go_live' column
+df['site_go_live'] = df['site_go_live'].replace(['', '00:00:00'], pd.NA)
 
-# Apply transformations
-merged['rad_site'] = merged.apply(get_rad_site, axis=1)
-merged['site_go_live'] = pd.to_datetime(merged['site_go_live'], errors='coerce')
-merged['need_by_date'] = pd.to_datetime(
-    merged.apply(
-        lambda row: row['need_by_date_infrastructure'] if row['part_type'] in ('infrastructure', '') else row[
-            'need_by_date_end_user_equipment'], axis=1),
-    errors='coerce'
-)
+# Process 'need_by_date' column
+df.loc[df['part_type'].str.lower().isin(['infrastructure', '', None]), 'need_by_date'] = df['need_by_date_infrastructure']
+df.loc[df['part_type'].str.lower() == 'end user equipment', 'need_by_date'] = df['need_by_date_end_user_equipment']
+df['need_by_date'] = df['need_by_date'].replace(['', '00:00:00'], pd.NA)
 
-# Clean cost and quantity columns
-for col in ['cost', 'quantity']:
-    merged[col] = pd.to_numeric(
-        merged[col].astype(str).str.replace(r'[$,]', '', regex=True).replace({'': '0', '.': '0'}),
-        errors='coerce'
-    ).fillna(0)
+# Process 'cost' column
+df['cost'] = df['cost'].astype(str).replace(['', '.', ','], '0')
+df['cost'] = df['cost'].str.replace('$', '').str.replace(',', '').astype(float)
 
-# Remove rows where site_type is null or empty
-merged = merged[merged['site_type'].notna() & (merged['site_type'] != '')]
-merged.drop(columns=['rad_site_infra', 'rad_site_eue'], inplace=True, errors="ignore")
-grps = {'country': ['country_x', 'country_y'], 'region': ['region_x', 'region_y']}
-merged = pd.lreshape(merged, grps).drop_duplicates().convert_dtypes()
+# Process 'quantity' column
+df['quantity'] = df['quantity'].astype(str).replace(['', '.', ','], '0')
+df['quantity'] = df['quantity'].str.replace(',', '').astype(float)
 
-output_columns = ['region', 'country', 'site_id', 'rad_site', 'demand_type', 'business_line', 'site_type',
-                  'building_type', 'car_status', 'por_confidence_level', 'mdf_type', 'mf_part_number',
-                  'mf_item_description', 'part_type', 'grouping', 'part_id', 'uin', 'vendor', 'manufacturer',
-                  'investment_id', 'investment_name', 'site_go_live', 'need_by_date', 'cost', 'quantity']
+# Handle missing 'need_by_date'
+df.loc[(df['part_type'].str.lower() == 'infrastructure') & df['need_by_date_infrastructure'].isna(), 'quantity'] = 0
+df.loc[(df['part_type'].str.lower() == 'end user equipment') & df[
+    'need_by_date_end_user_equipment'].isna(), 'quantity'] = 0
 
-merged = merged[output_columns]
+result_df = df[['region', 'country', 'site_id', 'rad_site', 'demand_type', 'business_line', 'site_type',
+                'building_type', 'car_status', 'por_confidence_level', 'mdf_type', 'mf_part_number',
+                'mf_item_description', 'part_type', 'grouping', 'part_id', 'uin', 'vendor', 'manufacturer',
+                'investment_id', 'investment_name', 'site_go_live', 'need_by_date', 'cost', 'quantity']]
+
+# select distinct
+result_df = result_df.drop_duplicates()
 
 timestr = time.strftime("%Y%m%d%H%M%S")
-unpivot_forecast = f'{timestr}_unpivot_forecast.xlsx'
-merged.to_excel(unpivot_forecast, index=False)
+unpivot_forecast = f'{timestr}_parts_forecast.xlsx'
+result_df.to_excel(unpivot_forecast, index=False)
 shutil.copyfile(
     unpivot_forecast,
     f'/content/drive/MyDrive/DemandPlanning/processed/{unpivot_forecast}')
+print(f'Uploaded {unpivot_forecast} to /processed folder.')
 # files.download(unpivot_forecast) -- replace if google drive upload not working
+
+print('[FINISHED]')
